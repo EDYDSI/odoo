@@ -1045,7 +1045,6 @@ class stock_picking(osv.osv):
             'origin': (invoice.origin or '') + ', ' + (picking.name or '') + (picking.origin and (':' + picking.origin) or ''),
             'comment': (comment and (invoice.comment and invoice.comment + "\n" + comment or comment)) or (invoice.comment and invoice.comment or ''),
             'date_invoice': context.get('date_inv', False),
-            'user_id': uid,
         }
 
     def _prepare_invoice(self, cr, uid, picking, partner, inv_type, journal_id, context=None):
@@ -1340,6 +1339,7 @@ class stock_picking(osv.osv):
                                {'name': sequence_obj.get(cr, uid,
                                             'stock.picking.%s'%(pick.type)),
                                })
+                    pick.refresh()
                     new_picking = self.copy(cr, uid, pick.id,
                             {
                                 'name': new_picking_name,
@@ -1397,9 +1397,8 @@ class stock_picking(osv.osv):
                 self.action_move(cr, uid, [new_picking], context=context)
                 wf_service.trg_validate(uid, 'stock.picking', new_picking, 'button_done', cr)
                 wf_service.trg_write(uid, 'stock.picking', pick.id, cr)
-                delivered_pack_id = pick.id
-                back_order_name = self.browse(cr, uid, delivered_pack_id, context=context).name
-                self.message_post(cr, uid, new_picking, body=_("Back order <em>%s</em> has been <b>created</b>.") % (back_order_name), context=context)
+                delivered_pack_id = new_picking
+                self.message_post(cr, uid, new_picking, body=_("Back order <em>%s</em> has been <b>created</b>.") % (pick.name), context=context)
             else:
                 self.action_move(cr, uid, [pick.id], context=context)
                 wf_service.trg_validate(uid, 'stock.picking', pick.id, 'button_done', cr)
@@ -1521,7 +1520,7 @@ class stock_production_lot(osv.osv):
         'product_id': lambda x, y, z, c: c.get('product_id', False),
     }
     _sql_constraints = [
-        ('name_ref_uniq', 'unique (name, ref)', 'The combination of Serial Number and internal reference must be unique !'),
+        ('name_ref_uniq', 'unique (name, ref, product_id, company_id)', 'The combination of Serial Number, internal reference, Product and Company must be unique !'),
     ]
     def action_traceability(self, cr, uid, ids, context=None):
         """ It traces the information of a product
@@ -1644,7 +1643,7 @@ class stock_move(osv.osv):
         return True
 
     _columns = {
-        'name': fields.char('Description', required=True, select=True),
+        'name': fields.char('Description', required=True, select=True, states={'done': [('readonly', True)]}),
         'priority': fields.selection([('0', 'Not urgent'), ('1', 'Urgent')], 'Priority'),
         'create_date': fields.datetime('Creation Date', readonly=True, select=True),
         'date': fields.datetime('Date', required=True, select=True, help="Move date: scheduled date until move is done, then date of actual move processing", states={'done': [('readonly', True)]}),
@@ -1692,15 +1691,15 @@ class stock_move(osv.osv):
                        "* Waiting Availability: This state is reached when the procurement resolution is not straight forward. It may need the scheduler to run, a component to me manufactured...\n"\
                        "* Available: When products are reserved, it is set to \'Available\'.\n"\
                        "* Done: When the shipment is processed, the state is \'Done\'."),
-        'price_unit': fields.float('Unit Price', digits_compute= dp.get_precision('Product Price'), help="Technical field used to record the product cost set by the user during a picking confirmation (when average price costing method is used)"),
-        'price_currency_id': fields.many2one('res.currency', 'Currency for average price', help="Technical field used to record the currency chosen by the user during a picking confirmation (when average price costing method is used)"),
+        'price_unit': fields.float('Unit Price', states={'done': [('readonly', True)]}, help="Technical field used to record the product cost set by the user during a picking confirmation (when average price costing method is used)"),
+        'price_currency_id': fields.many2one('res.currency', 'Currency for average price', states={'done': [('readonly', True)]}, help="Technical field used to record the currency chosen by the user during a picking confirmation (when average price costing method is used)"),
         'company_id': fields.many2one('res.company', 'Company', required=True, select=True),
         'backorder_id': fields.related('picking_id','backorder_id',type='many2one', relation="stock.picking", string="Back Order of", select=True),
-        'origin': fields.related('picking_id','origin',type='char', size=64, relation="stock.picking", string="Source", store=True),
+        'origin': fields.related('picking_id','origin',type='char', size=64, relation="stock.picking", string="Source", store=True, states={'done': [('readonly', True)]}),
 
         # used for colors in tree views:
         'scrapped': fields.related('location_dest_id','scrap_location',type='boolean',relation='stock.location',string='Scrapped', readonly=True),
-        'type': fields.related('picking_id', 'type', type='selection', selection=[('out', 'Sending Goods'), ('in', 'Getting Goods'), ('internal', 'Internal')], string='Shipping Type'),
+        'type': fields.related('picking_id', 'type', type='selection', selection=[('out', 'Sending Goods'), ('in', 'Getting Goods'), ('internal', 'Internal')], string='Shipping Type', states={'done': [('readonly', True)]}),
     }
 
     def _check_location(self, cr, uid, ids, context=None):
@@ -1935,7 +1934,6 @@ class stock_move(osv.osv):
         result = {
                   'product_qty': 0.00
           }
-        warning = {}
 
         if (not product_id) or (product_uos_qty <=0.0):
             result['product_uos_qty'] = 0.0
@@ -1943,22 +1941,15 @@ class stock_move(osv.osv):
 
         product_obj = self.pool.get('product.product')
         uos_coeff = product_obj.read(cr, uid, product_id, ['uos_coeff'])
-        
-        # Warn if the quantity was decreased 
-        for move in self.read(cr, uid, ids, ['product_uos_qty']):
-            if product_uos_qty < move['product_uos_qty']:
-                warning.update({
-                   'title': _('Warning: No Back Order'),
-                   'message': _("By changing the quantity here, you accept the "
-                                "new quantity as complete: OpenERP will not "
-                                "automatically generate a Back Order.") })
-                break
+
+        # No warning if the quantity was decreased to avoid double warnings:
+        # The clients should call onchange_quantity too anyway
 
         if product_uos and product_uom and (product_uom != product_uos):
             result['product_qty'] = uos_coeff['uos_coeff'] and product_uos_qty / uos_coeff['uos_coeff'] or 0.0
         else:
             result['product_qty'] = product_uos_qty
-        return {'value': result, 'warning': warning}
+        return {'value': result}
 
     def onchange_product_id(self, cr, uid, ids, prod_id=False, loc_id=False,
                             loc_dest_id=False, partner_id=False):
@@ -1982,14 +1973,13 @@ class stock_move(osv.osv):
         product = self.pool.get('product.product').browse(cr, uid, [prod_id], context=ctx)[0]
         uos_id  = product.uos_id and product.uos_id.id or False
         result = {
+            'name': product.partner_ref,
             'product_uom': product.uom_id.id,
             'product_uos': uos_id,
             'product_qty': 1.00,
             'product_uos_qty' : self.pool.get('stock.move').onchange_quantity(cr, uid, ids, prod_id, 1.00, product.uom_id.id, uos_id)['value']['product_uos_qty'],
             'prodlot_id' : False,
         }
-        if not ids:
-            result['name'] = product.partner_ref
         if loc_id:
             result['location_id'] = loc_id
         if loc_dest_id:
@@ -2477,6 +2467,8 @@ class stock_move(osv.osv):
         """
         # prepare default values considering that the destination accounts have the reference_currency_id as their main currency
         partner_id = (move.picking_id.partner_id and self.pool.get('res.partner')._find_accounting_partner(move.picking_id.partner_id).id) or False
+        cur_obj = self.pool.get('res.currency')
+        reference_amount = cur_obj.round(cr, uid, cur_obj.browse(cr, uid, reference_currency_id), reference_amount)
         debit_line_vals = {
                     'name': move.name,
                     'product_id': move.product_id and move.product_id.id or False,
@@ -2506,7 +2498,6 @@ class stock_move(osv.osv):
         src_acct, dest_acct = account_obj.browse(cr, uid, [src_account_id, dest_account_id], context=context)
         src_main_currency_id = src_acct.company_id.currency_id.id
         dest_main_currency_id = dest_acct.company_id.currency_id.id
-        cur_obj = self.pool.get('res.currency')
         if reference_currency_id != src_main_currency_id:
             # fix credit line:
             credit_line_vals['credit'] = cur_obj.compute(cr, uid, reference_currency_id, src_main_currency_id, reference_amount, context=context)
